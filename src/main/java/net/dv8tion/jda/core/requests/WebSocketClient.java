@@ -47,6 +47,8 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.time.OffsetDateTime;
 import java.util.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
@@ -91,11 +93,31 @@ public class WebSocketClient extends WebSocketAdapter implements WebSocketListen
     protected boolean firstInit = true;
     protected boolean processingReady = true;
 
+    protected BlockingQueue<String> eventQueue = new LinkedBlockingQueue<>();
+    protected Thread eventQueueWorker;
+
     public WebSocketClient(JDAImpl api)
     {
         this.api = api;
         this.shardInfo = api.getShardInfo();
         this.shouldReconnect = api.isAutoReconnect();
+        this.eventQueueWorker = new Thread(() ->
+        {
+            while (api.getStatus() != JDA.Status.SHUTDOWN)
+            {
+                try
+                {
+                    process(eventQueue.take());
+                }
+                catch (InterruptedException ignored) {
+                    
+                }
+                catch (Exception e) {
+                    handleCallbackError(socket, e);
+                }
+            }
+        }, "JDA-Thread " + api.getIdentifierString() + " EventQueueWorker");
+        eventQueueWorker.start();
         setupHandlers();
         setupSendingThread();
         connect();
@@ -322,6 +344,11 @@ public class WebSocketClient extends WebSocketAdapter implements WebSocketListen
     public void close()
     {
         socket.sendClose(1000);
+        if (eventQueueWorker != null)
+        {
+            eventQueueWorker.interrupt();
+            eventQueueWorker = null;
+        }
     }
 
     public void close(int code)
@@ -498,9 +525,7 @@ public class WebSocketClient extends WebSocketAdapter implements WebSocketListen
             }
         }
     }
-
-    @Override
-    public void onTextMessage(WebSocket websocket, String message)
+    private void process(String message)
     {
         JSONObject content = new JSONObject(message);
         int opCode = content.getInt("op");
@@ -549,6 +574,21 @@ public class WebSocketClient extends WebSocketAdapter implements WebSocketListen
                 break;
             default:
                 LOG.debug("Got unknown op-code: " + opCode + " with content: " + message);
+        }
+    }
+
+    @Override
+    public void onTextMessage(WebSocket websocket, String message)
+    {
+        this.eventQueue.offer(message);
+        int queueSize = eventQueue.size();
+        if (queueSize > 0 && queueSize % 500 == 0)
+        {
+            LOG.warn("eventWorker seems to be deadlocked, eventQueue size is "+ queueSize);
+            for (StackTraceElement element : Thread.getAllStackTraces().get(eventQueueWorker))
+            {
+                System.err.println(element.toString());
+            }
         }
     }
 
